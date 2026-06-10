@@ -9,7 +9,7 @@
 
 A lightweight, high-performance HTML5 Block Puzzle game built from scratch with Vanilla JS and Canvas. Zero external assets, fully responsive, and optimized for smooth game feel.
 
-🎮 **[在线试玩 / Play Live Demo]([链接](https://wildchiken.github.io/block-puzzle-html5-clone/))**
+🎮 **[在线试玩 / Play Live Demo](https://wildchiken.github.io/block-puzzle-html5-clone/)**
 
 ---
 
