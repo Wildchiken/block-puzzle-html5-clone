@@ -506,7 +506,8 @@ const THEMES = ['', 'neon', 'dark'];
 /* 方块图鉴(原版无旋转,各方向独立成块) */
 const SHAPES = (() => {
   const S = [];
-  const add = (m, c, w) => S.push({m, c, w});
+  const add = (m, c, w) => S.push({m, c, w, a: m.flat().reduce((x,y)=>x+y,0)});
+  add([[1]],6,1.5);                                                // 1x1
   add([[1,1]],2,5);            add([[1],[1]],2,5);                 // 1x2
   add([[1,1,1]],1,5);          add([[1],[1],[1]],1,5);             // 1x3
   add([[1,1,1,1]],4,4);        add([[1],[1],[1],[1]],4,4);         // 1x4
@@ -536,7 +537,23 @@ const SHAPES = (() => {
   add([[1,0,0],[1,1,1]],2,2);   add([[0,0,1],[1,1,1]],2,2);
   return S;
 })();
-const TOTAL_W = SHAPES.reduce((a,s)=>a+s.w,0);
+/* ================= 发牌调参 ================= */
+const TUNE = {
+  honeyScore: 5000,                           // 此分数下整手保证可解,之上保留挑战
+  rescueFill: .50, rescueFit: .50,            // 救援态:填充率 / 可放形状占比 阈值
+  pressFill: .25,                             // 压迫态:填充率上限(且近2手有消行)
+  bigArea: 5,                                 // 面积≥此值视为大块
+  wBig:   {rescue:.3,  normal:1, press:2  },  // 大块权重系数
+  wSmall: {rescue:1.6, normal:1, press:.6 },  // 小块(面积≤2)权重系数
+  helperP:{rescue:.85, normal:.45, press:.12},// 塞入"放下即消行"牌的概率
+  rerollSolvable:12, rerollAlive:20,          // 两层保底的重抽上限
+  warmDeaths:2, warmMoves:15,                 // 连续2局<15步速死 → 下局暖局
+};
+const MODE_W = {};
+for(const md of ['rescue','normal','press']){
+  const ws = SHAPES.map(s => s.w * (s.a>=TUNE.bigArea ? TUNE.wBig[md] : s.a<=2 ? TUNE.wSmall[md] : 1));
+  MODE_W[md] = {ws, total: ws.reduce((a,b)=>a+b,0)};
+}
 
 /* ================= 状态 ================= */
 let grid = [];
@@ -545,6 +562,9 @@ let score = 0, shownScore = 0;
 let best  = +localStorage.getItem('blockblastClassicHigh') || 0;
 let combo = 0;
 let movesSinceClear = 0;
+let handsSinceClear = 99;   // 距上次消行隔了几手牌(压迫态判定)
+let placedCount = 0;        // 本局放置步数(暖局判定)
+let warmGame = false;       // 暖局:本局全程按救援态发牌
 let playing = true;
 let themeIdx = +localStorage.getItem('bb_theme') || 0;
 let sndOn = localStorage.getItem('bb_sound') !== '0';
@@ -589,17 +609,17 @@ function paintCell(r,c){
   const d = cells[r][c];
   d.className = 'cell' + (grid[r][c] !== null ? ' blk ' + COLORS[grid[r][c]] : '');
 }
-function canPlace(m, r0, c0){
+function canPlace(m, r0, c0, g = grid){
   for(let r=0;r<m.length;r++)for(let c=0;c<m[0].length;c++){
     if(!m[r][c]) continue;
     const R=r0+r, C=c0+c;
-    if(R<0||R>=N||C<0||C>=N||grid[R][C]!==null) return false;
+    if(R<0||R>=N||C<0||C>=N||g[R][C]!==null) return false;
   }
   return true;
 }
-function canPlaceAnywhere(m){
+function canPlaceAnywhere(m, g = grid){
   for(let r=0;r<=N-m.length;r++)for(let c=0;c<=N-m[0].length;c++)
-    if(canPlace(m,r,c)) return true;
+    if(canPlace(m,r,c,g)) return true;
   return false;
 }
 
@@ -624,15 +644,108 @@ function flashTheme(){
 }
 
 /* ================= 手牌 ================= */
-function randShape(){
-  let t = Math.random()*TOTAL_W;
-  for(const s of SHAPES){ t -= s.w; if(t<=0) return s; }
+/* 发牌按棋盘状态在 救援/常规/压迫 三态间切换 */
+function randShape(mode = 'normal'){
+  const {ws, total} = MODE_W[mode];
+  let t = Math.random()*total;
+  for(let i=0;i<SHAPES.length;i++){ t -= ws[i]; if(t<=0) return SHAPES[i]; }
   return SHAPES[0];
 }
+function boardStats(g){
+  let filled = 0;
+  for(let r=0;r<N;r++)for(let c=0;c<N;c++) if(g[r][c]!==null) filled++;
+  let fit = 0;
+  for(const s of SHAPES) if(canPlaceAnywhere(s.m, g)) fit++;
+  return {fill: filled/(N*N), fitRatio: fit/SHAPES.length};
+}
+/* 在(r0,c0)放下 m 后能否凑满一行或一列 */
+function clearsLine(g, m, r0, c0){
+  const H = m.length, W = m[0].length;
+  for(let r=0;r<H;r++){
+    let full = true;
+    for(let c=0;c<N && full;c++)
+      if(g[r0+r][c]===null && !(c>=c0 && c<c0+W && m[r][c-c0])) full = false;
+    if(full) return true;
+  }
+  for(let c=0;c<W;c++){
+    let full = true;
+    for(let r=0;r<N && full;r++)
+      if(g[r][c0+c]===null && !(r>=r0 && r<r0+H && m[r-r0][c])) full = false;
+    if(full) return true;
+  }
+  return false;
+}
+/* 放下就能消行的形状 */
+function helperShapes(g){
+  const out = [];
+  for(const s of SHAPES){
+    const H = s.m.length, W = s.m[0].length;
+    let hit = false;
+    for(let r=0;r<=N-H && !hit;r++)for(let c=0;c<=N-W && !hit;c++)
+      if(canPlace(s.m,r,c,g) && clearsLine(g,s.m,r,c)) hit = true;
+    if(hit) out.push(s);
+  }
+  return out;
+}
+/* 三张能否按某种顺序全部放下(含消行) */
+function handSolvable(g, trio){
+  const orders = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+  for(const ord of orders){
+    const sim = g.map(row=>row.slice());
+    let ok = true;
+    for(const i of ord){
+      const m = trio[i].m;
+      let placed = false;
+      for(let r=0;r<=N-m.length && !placed;r++)for(let c=0;c<=N-m[0].length && !placed;c++){
+        if(!canPlace(m,r,c,sim)) continue;
+        for(let rr=0;rr<m.length;rr++)for(let cc=0;cc<m[0].length;cc++) if(m[rr][cc]) sim[r+rr][c+cc] = 0;
+        const fr=[], fc=[];
+        for(let rr=0;rr<N;rr++) if(sim[rr].every(v=>v!==null)) fr.push(rr);
+        for(let cc=0;cc<N;cc++){
+          let f = true;
+          for(let rr=0;rr<N;rr++) if(sim[rr][cc]===null){ f=false; break; }
+          if(f) fc.push(cc);
+        }
+        fr.forEach(rr=>sim[rr].fill(null));
+        fc.forEach(cc=>{ for(let rr=0;rr<N;rr++) sim[rr][cc]=null; });
+        placed = true;
+      }
+      if(!placed){ ok = false; break; }
+    }
+    if(ok) return true;
+  }
+  return false;
+}
+function dealHand(g = grid, sc = score, recentClear = handsSinceClear <= 2, warm = warmGame){
+  const st = boardStats(g);
+  let mode = 'normal';
+  if(warm || st.fill >= TUNE.rescueFill || st.fitRatio <= TUNE.rescueFit) mode = 'rescue';
+  else if(st.fill <= TUNE.pressFill && recentClear) mode = 'press';
+  const helpers = helperShapes(g);
+  const draw = () => {
+    const t = [randShape(mode), randShape(mode), randShape(mode)];
+    if(helpers.length && Math.random() < TUNE.helperP[mode])
+      t[(Math.random()*3)|0] = helpers[(Math.random()*helpers.length)|0];
+    return t;
+  };
+  /* 中段及暖局:整手保证可解 */
+  if(warm || sc < TUNE.honeyScore){
+    for(let i=0;i<TUNE.rerollSolvable;i++){
+      const t = draw();
+      if(handSolvable(g, t)) return t;
+    }
+  }
+  /* 保底:至少一张能放下 */
+  let t = null;
+  for(let i=0;i<TUNE.rerollAlive;i++){
+    t = draw();
+    if(t.some(s=>canPlaceAnywhere(s.m, g))) return t;
+  }
+  return t;
+}
 function newHand(){
-  let trio;
-  do { trio = [randShape(), randShape(), randShape()]; }
-  while (trio[0]===trio[1] && trio[1]===trio[2]);
+  handsSinceClear++;
+  const trio = dealHand();
   for(let i=0;i<3;i++){ hand[i]=trio[i]; renderPiece(i, i*60); }
   updateDims();
 }
@@ -828,6 +941,7 @@ function place(idx, s, r0, c0){
     cellsN++;
   }
   addScore(cellsN);
+  placedCount++;
   sPlace(); vib(18);
 
   hand[idx] = null;
@@ -857,7 +971,7 @@ function checkClears(cr, cc, colorIdx){
 
   /* 计分:每行基础10分,连击每级+10,多行平方加成 */
   const pts = lines * lines * (10 + 10 * combo);
-  combo++; movesSinceClear = 0;
+  combo++; movesSinceClear = 0; handsSinceClear = 0;
   addScore(pts);
 
   const toClear = new Map();
@@ -902,10 +1016,12 @@ function checkClears(cr, cc, colorIdx){
     wrapEl.classList.add('shake');
   }
 
-  /* —— 全消!背景变换主题 —— */
+  /* —— 全消!奖励分+背景变换主题 —— */
   if(grid.every(row=>row.every(v=>v===null))){
+    addScore(300);
     setTimeout(()=>{
       praise(I18N[lang].allClear, 0, true);
+      floatScore((br.left-wr.left)+br.width/2, (br.top-wr.top)+br.height/2, '+300', true);
       confetti(60);
       sFanfare();
       vib([60,50,60,50,100]);
@@ -922,11 +1038,16 @@ function ratingFor(c){
   return null;
 }
 
+const loadRuns = () => { try { return JSON.parse(localStorage.getItem('bb_runs')) || []; } catch(e){ return []; } };
 function checkDead(){
   if(!playing) return;
   const alive = hand.some(h => h && canPlaceAnywhere(h.m));
   if(alive || hand.every(h=>h===null)) return;
   playing = false;
+  /* 记录本局步数,供暖局判定 */
+  const runs = loadRuns();
+  runs.push(placedCount);
+  localStorage.setItem('bb_runs', JSON.stringify(runs.slice(-3)));
   updateDanger();
   /* 1. No Space Left 横幅 */
   sOver(); vib([80,60,120]);
@@ -1226,6 +1347,9 @@ function syncSwitches(){
 function restart(){
   grid = Array.from({length:N}, ()=>Array(N).fill(null));
   score = 0; shownScore = 0; combo = 0; movesSinceClear = 0;
+  handsSinceClear = 99; placedCount = 0;
+  const runs = loadRuns();
+  warmGame = runs.length >= TUNE.warmDeaths && runs.slice(-TUNE.warmDeaths).every(n => n < TUNE.warmMoves);
   playing = true;
   scoreEl.textContent = '0';
   bestEl.textContent = best;
